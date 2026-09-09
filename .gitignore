@@ -1,0 +1,17 @@
+# Dot-prefixed files and directories are local-only
+# (.claude, go/.docs, .DS_Store, .idea, .vscode, ...)
+.*
+!.gitignore
+
+# Local database directories produced by demos and tests
+data/
+*.data
+*.hint
+
+# Go
+bin/
+*.exe
+*.test
+*.out
+coverage.txt
+*.prof
