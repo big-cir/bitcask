@@ -9,15 +9,35 @@ import (
 	"testing"
 )
 
-func openTestDB(t *testing.T) (*DB, string) {
+func mustOpen(t *testing.T, dir string, opts ...Option) *DB {
 	t.Helper()
-	dir := t.TempDir()
-	db, err := Open(dir)
+	db, err := Open(dir, opts...)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+	return db
+}
+
+func mustClose(t *testing.T, db *DB) {
+	t.Helper()
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func openTestDB(t *testing.T) (*DB, string) {
+	t.Helper()
+	dir := t.TempDir()
+	db := mustOpen(t, dir)
 	t.Cleanup(func() { db.Close() })
 	return db, dir
+}
+
+func mustPut(t *testing.T, db *DB, key, value string) {
+	t.Helper()
+	if err := db.Put([]byte(key), []byte(value)); err != nil {
+		t.Fatalf("Put(%q): %v", key, err)
+	}
 }
 
 func assertGet(t *testing.T, db *DB, key, want string) {
@@ -31,47 +51,72 @@ func assertGet(t *testing.T, db *DB, key, want string) {
 	}
 }
 
+func assertAbsent(t *testing.T, db *DB, key string) {
+	t.Helper()
+	if _, err := db.Get([]byte(key)); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("Get(%q) = %v, want ErrKeyNotFound", key, err)
+	}
+}
+
+// datafilePaths returns the data files in dir, ascending by id. The last one
+// is the active file.
+func datafilePaths(t *testing.T, dir string) []string {
+	t.Helper()
+	ids, err := datafileIDs(dir)
+	if err != nil {
+		t.Fatalf("datafileIDs: %v", err)
+	}
+	paths := make([]string, len(ids))
+	for i, id := range ids {
+		paths[i] = filepath.Join(dir, datafileName(id))
+	}
+	return paths
+}
+
+func fileSize(t *testing.T, path string) int64 {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	return fi.Size()
+}
+
+// ---------- single-session behaviour ----------
+
 func TestPutGet(t *testing.T) {
 	db, _ := openTestDB(t)
 
-	if err := db.Put([]byte("k"), []byte("v")); err != nil {
-		t.Fatal(err)
-	}
+	mustPut(t, db, "k", "v")
 	assertGet(t, db, "k", "v")
 
-	if err := db.Put([]byte("k"), []byte("v2")); err != nil {
-		t.Fatal(err)
-	}
+	mustPut(t, db, "k", "v2")
 	assertGet(t, db, "k", "v2")
 
-	if _, err := db.Get([]byte("missing")); !errors.Is(err, ErrKeyNotFound) {
-		t.Fatalf("Get of absent key = %v, want ErrKeyNotFound", err)
-	}
+	assertAbsent(t, db, "missing")
 }
 
 func TestPutGetManyKeys(t *testing.T) {
 	db, _ := openTestDB(t)
 
 	const n = 1000
-	value := func(i int) string {
-		return fmt.Sprintf("value-%d-%s", i, bytes.Repeat([]byte("x"), i%37))
-	}
-
 	for i := 0; i < n; i++ {
-		if err := db.Put([]byte(fmt.Sprintf("key_%04d", i)), []byte(value(i))); err != nil {
-			t.Fatalf("Put %d: %v", i, err)
-		}
+		mustPut(t, db, fmt.Sprintf("key_%04d", i), testValue(i))
 	}
 	for i := 0; i < n; i++ {
-		assertGet(t, db, fmt.Sprintf("key_%04d", i), value(i))
+		assertGet(t, db, fmt.Sprintf("key_%04d", i), testValue(i))
 	}
 	if got := db.Len(); got != n {
 		t.Fatalf("Len = %d, want %d", got, n)
 	}
 }
 
+func testValue(i int) string {
+	return fmt.Sprintf("value-%d-%s", i, bytes.Repeat([]byte("x"), i%37))
+}
+
 // An empty value is real data and must round-trip; an empty key is rejected.
-// The distinction matters once deletion is introduced, because a tombstone is
+// The distinction is what makes the tombstone flag necessary: a deletion is
 // also a record with no value bytes.
 func TestEmptyKeyAndValue(t *testing.T) {
 	db, _ := openTestDB(t)
@@ -79,10 +124,11 @@ func TestEmptyKeyAndValue(t *testing.T) {
 	if err := db.Put(nil, []byte("v")); !errors.Is(err, ErrEmptyKey) {
 		t.Fatalf("Put with empty key = %v, want ErrEmptyKey", err)
 	}
-
-	if err := db.Put([]byte("empty"), []byte{}); err != nil {
-		t.Fatalf("Put with empty value: %v", err)
+	if err := db.Delete(nil); !errors.Is(err, ErrEmptyKey) {
+		t.Fatalf("Delete with empty key = %v, want ErrEmptyKey", err)
 	}
+
+	mustPut(t, db, "empty", "")
 	got, err := db.Get([]byte("empty"))
 	if err != nil {
 		t.Fatalf("Get of empty value: %v", err)
@@ -105,51 +151,79 @@ func TestOverwriteAppends(t *testing.T) {
 		}
 	}
 
-	fi, err := os.Stat(filepath.Join(dir, datafileName(firstFileID)))
-	if err != nil {
-		t.Fatal(err)
-	}
+	size := fileSize(t, filepath.Join(dir, datafileName(firstFileID)))
 	recSize := int64(headerSize + len("k") + len(value))
-	if want := recSize * rounds; fi.Size() != want {
-		t.Fatalf("file size = %d, want %d", fi.Size(), want)
+	if want := recSize * rounds; size != want {
+		t.Fatalf("file size = %d, want %d", size, want)
 	}
 	t.Logf("%d bytes on disk hold %d bytes of live data (%.1f%% garbage)",
-		fi.Size(), recSize, 100*float64(fi.Size()-recSize)/float64(fi.Size()))
+		size, recSize, 100*float64(size-recSize)/float64(size))
 }
 
-func TestOpenRejectsExistingData(t *testing.T) {
+func TestDeleteRemovesKey(t *testing.T) {
+	db, _ := openTestDB(t)
+
+	mustPut(t, db, "k", "v")
+	if err := db.Delete([]byte("k")); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	assertAbsent(t, db, "k")
+	if got := db.Len(); got != 0 {
+		t.Fatalf("Len = %d, want 0", got)
+	}
+
+	// Deleting what is not there writes nothing: a tombstone for an absent key
+	// can never shadow anything, so it would be pure garbage.
+	if err := db.Delete([]byte("k")); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("Delete of absent key = %v, want ErrKeyNotFound", err)
+	}
+}
+
+func TestSizeLimits(t *testing.T) {
 	dir := t.TempDir()
+	db := mustOpen(t, dir, WithMaxKeySize(8), WithMaxValueSize(16))
+	defer db.Close()
 
-	db, err := Open(dir)
-	if err != nil {
-		t.Fatal(err)
+	if err := db.Put(bytes.Repeat([]byte("k"), 9), []byte("v")); !errors.Is(err, ErrKeyTooLarge) {
+		t.Fatalf("oversized key = %v, want ErrKeyTooLarge", err)
 	}
-	if err := db.Put([]byte("k"), []byte("v")); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
+	if err := db.Put([]byte("k"), bytes.Repeat([]byte("v"), 17)); !errors.Is(err, ErrValueTooLarge) {
+		t.Fatalf("oversized value = %v, want ErrValueTooLarge", err)
 	}
 
-	if _, err := Open(dir); !errors.Is(err, ErrExistingData) {
-		t.Fatalf("reopen = %v, want ErrExistingData", err)
+	mustPut(t, db, "12345678", "1234567890123456")
+	assertGet(t, db, "12345678", "1234567890123456")
+}
+
+func TestOpenRejectsUnusableOptions(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opt  Option
+	}{
+		{"zero MaxFileSize", WithMaxFileSize(0)},
+		{"zero MaxKeySize", WithMaxKeySize(0)},
+		{"zero MaxValueSize", WithMaxValueSize(0)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Open(t.TempDir(), tc.opt); err == nil {
+				t.Fatal("Open accepted the option, want an error")
+			}
+		})
 	}
 }
 
 func TestOperationsAfterClose(t *testing.T) {
-	db, err := Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
+	db := mustOpen(t, t.TempDir())
+	mustClose(t, db)
 
 	if err := db.Put([]byte("k"), []byte("v")); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Put after Close = %v, want ErrClosed", err)
 	}
 	if _, err := db.Get([]byte("k")); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Get after Close = %v, want ErrClosed", err)
+	}
+	if err := db.Delete([]byte("k")); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Delete after Close = %v, want ErrClosed", err)
 	}
 	if err := db.Close(); !errors.Is(err, ErrClosed) {
 		t.Fatalf("second Close = %v, want ErrClosed", err)
@@ -161,9 +235,7 @@ func TestOperationsAfterClose(t *testing.T) {
 func TestGetReturnsOwnedSlice(t *testing.T) {
 	db, _ := openTestDB(t)
 
-	if err := db.Put([]byte("k"), []byte("original")); err != nil {
-		t.Fatal(err)
-	}
+	mustPut(t, db, "k", "original")
 	got, err := db.Get([]byte("k"))
 	if err != nil {
 		t.Fatal(err)
@@ -171,4 +243,246 @@ func TestGetReturnsOwnedSlice(t *testing.T) {
 	copy(got, []byte("MODIFIED"))
 
 	assertGet(t, db, "k", "original")
+}
+
+// ---------- recovery ----------
+
+func TestReopenRestoresAllKeys(t *testing.T) {
+	dir := t.TempDir()
+
+	const n = 1000
+	db := mustOpen(t, dir)
+	for i := 0; i < n; i++ {
+		mustPut(t, db, fmt.Sprintf("key_%04d", i), testValue(i))
+	}
+	mustClose(t, db)
+
+	// Nothing about the index was written to disk. Everything below was
+	// rebuilt by replaying the log.
+	db = mustOpen(t, dir)
+	defer db.Close()
+
+	if got := db.Len(); got != n {
+		t.Fatalf("Len after reopen = %d, want %d", got, n)
+	}
+	for i := 0; i < n; i++ {
+		assertGet(t, db, fmt.Sprintf("key_%04d", i), testValue(i))
+	}
+}
+
+// The tombstone is the whole reason a deletion survives a restart. Recovery
+// replays the log, so the original Put record is read again; only a later
+// record for the same key can outrank it.
+func TestDeleteDoesNotResurrectValue(t *testing.T) {
+	dir := t.TempDir()
+
+	db := mustOpen(t, dir)
+	mustPut(t, db, "gone", "value")
+	mustPut(t, db, "kept", "value")
+	if err := db.Delete([]byte("gone")); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	mustClose(t, db)
+
+	db = mustOpen(t, dir)
+	defer db.Close()
+
+	assertAbsent(t, db, "gone")
+	assertGet(t, db, "kept", "value")
+	if got := db.Len(); got != 1 {
+		t.Fatalf("Len after reopen = %d, want 1", got)
+	}
+}
+
+func TestRotationAndReopen(t *testing.T) {
+	dir := t.TempDir()
+	opts := []Option{WithMaxFileSize(4 << 10)}
+
+	const n = 200
+	db := mustOpen(t, dir, opts...)
+	for i := 0; i < n; i++ {
+		mustPut(t, db, fmt.Sprintf("key_%04d", i), testValue(i))
+	}
+	mustClose(t, db)
+
+	paths := datafilePaths(t, dir)
+	if len(paths) < 2 {
+		t.Fatalf("got %d data file(s), want several with a 4 KiB limit", len(paths))
+	}
+	t.Logf("%d keys spread over %d data files", n, len(paths))
+
+	db = mustOpen(t, dir, opts...)
+	defer db.Close()
+
+	if got := db.Len(); got != n {
+		t.Fatalf("Len after reopen = %d, want %d", got, n)
+	}
+	for i := 0; i < n; i++ {
+		assertGet(t, db, fmt.Sprintf("key_%04d", i), testValue(i))
+	}
+}
+
+// If the sequence counter restarted at 1 instead of continuing from the
+// highest seq in the log, the second write of a key would tie with the first
+// and lose the "highest seq wins" comparison — leaving the stale value in the
+// index with no error anywhere.
+func TestSeqContinuesAcrossReopen(t *testing.T) {
+	dir := t.TempDir()
+
+	db := mustOpen(t, dir)
+	mustPut(t, db, "a", "first")
+	mustClose(t, db)
+
+	db = mustOpen(t, dir)
+	mustPut(t, db, "a", "second")
+	mustClose(t, db)
+
+	db = mustOpen(t, dir)
+	defer db.Close()
+	assertGet(t, db, "a", "second")
+}
+
+// A crash leaves a partial record at the end of the file that was being
+// written. Those bytes were never acknowledged to a caller, so recovery
+// truncates them and carries on; refusing to open would mean a database that
+// never survives an ordinary crash.
+func TestOpenTruncatesTornTail(t *testing.T) {
+	// The three lengths take different paths through the four checks: too
+	// short for a header, exactly a header's worth of nonsense, and a header
+	// whose lengths point past the end of the file.
+	for _, garbage := range []int{5, headerSize, 64} {
+		t.Run(fmt.Sprintf("%d bytes", garbage), func(t *testing.T) {
+			dir := t.TempDir()
+
+			db := mustOpen(t, dir)
+			mustPut(t, db, "before", "value")
+			mustClose(t, db)
+
+			paths := datafilePaths(t, dir)
+			active := paths[len(paths)-1]
+			intact := fileSize(t, active)
+
+			appendBytes(t, active, bytes.Repeat([]byte("g"), garbage))
+			if got := fileSize(t, active); got != intact+int64(garbage) {
+				t.Fatalf("setup: file is %d bytes, want %d", got, intact+int64(garbage))
+			}
+
+			db = mustOpen(t, dir)
+			defer db.Close()
+
+			if got := fileSize(t, active); got != intact {
+				t.Fatalf("file is %d bytes after recovery, want it truncated to %d", got, intact)
+			}
+			assertGet(t, db, "before", "value")
+
+			// The truncation has to leave the file appendable. Without it the
+			// record below would land on top of the garbage, and the log would
+			// be unparseable from that point on — this key would be
+			// unreachable after the next restart.
+			mustPut(t, db, "after", "value")
+			assertGet(t, db, "after", "value")
+		})
+	}
+}
+
+func TestTornTailSurvivesAnotherRestart(t *testing.T) {
+	dir := t.TempDir()
+
+	db := mustOpen(t, dir)
+	mustPut(t, db, "before", "value")
+	mustClose(t, db)
+
+	paths := datafilePaths(t, dir)
+	appendBytes(t, paths[len(paths)-1], []byte("garbage on the tail"))
+
+	db = mustOpen(t, dir)
+	mustPut(t, db, "after", "value")
+	mustClose(t, db)
+
+	db = mustOpen(t, dir)
+	defer db.Close()
+	assertGet(t, db, "before", "value")
+	assertGet(t, db, "after", "value")
+}
+
+// The same damage in a sealed file has no crash to explain it: nothing has
+// written to that file since it was fsynced. Truncating it would silently
+// discard every record after the damage, so Open refuses instead.
+func TestOpenRejectsCorruptedSealedFile(t *testing.T) {
+	dir := t.TempDir()
+	opts := []Option{WithMaxFileSize(1 << 10)}
+
+	db := mustOpen(t, dir, opts...)
+	for i := 0; i < 100; i++ {
+		mustPut(t, db, fmt.Sprintf("key_%04d", i), testValue(i))
+	}
+	mustClose(t, db)
+
+	paths := datafilePaths(t, dir)
+	if len(paths) < 2 {
+		t.Fatalf("got %d data file(s), want at least 2", len(paths))
+	}
+	// Inside the first record of the first file, which rotation sealed long
+	// before the process exited.
+	flipByte(t, paths[0], headerSize+2)
+
+	db, err := Open(dir, opts...)
+	if err == nil {
+		db.Close()
+		t.Fatal("Open succeeded on a corrupted sealed file")
+	}
+	if !errors.Is(err, ErrCorrupted) {
+		t.Fatalf("Open = %v, want ErrCorrupted", err)
+	}
+}
+
+// A stray file this package did not write is left alone rather than treated as
+// a reason to refuse the whole directory.
+func TestOpenIgnoresForeignFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	db := mustOpen(t, dir)
+	mustPut(t, db, "k", "v")
+	mustClose(t, db)
+
+	if err := os.WriteFile(filepath.Join(dir, "notes.data"), []byte("not a log"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	db = mustOpen(t, dir)
+	defer db.Close()
+	assertGet(t, db, "k", "v")
+}
+
+func appendBytes(t *testing.T, path string, b []byte) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatalf("open for append: %v", err)
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		t.Fatalf("append: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
+func flipByte(t *testing.T, path string, off int64) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open for flip: %v", err)
+	}
+	defer f.Close()
+
+	b := make([]byte, 1)
+	if _, err := f.ReadAt(b, off); err != nil {
+		t.Fatalf("read at %d: %v", off, err)
+	}
+	b[0] ^= 0xFF
+	if _, err := f.WriteAt(b, off); err != nil {
+		t.Fatalf("write at %d: %v", off, err)
+	}
 }

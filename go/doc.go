@@ -45,10 +45,22 @@
 // sequence number: wall clocks can move backwards, and compaction reorders
 // files, so "highest seq wins" is the only rule that stays correct.
 //
+// # Durability
+//
+// Every record carries a CRC-32C over its own bytes, and Open replays the log
+// to rebuild the index. A crash leaves a partial record at the end of the file
+// that was being written; recovery truncates it and continues, because those
+// bytes never returned success to a caller. The same damage inside a sealed
+// file has no such explanation and returns ErrCorrupted instead.
+//
+// Nothing is fsynced per write yet. Data reaches the operating system's page
+// cache, which survives the process being killed but not the machine losing
+// power.
+//
 // # Status
 //
 // This engine is built in stages. The current stage implements append-only
-// writes and the in-memory index. Checksum verification, deletes, file
-// rotation, crash recovery, hint files, compaction, and durability policies
+// writes, the in-memory index, checksums, deletes, file rotation, and crash
+// recovery. Hint files, compaction, durability policies, and concurrent access
 // are not yet implemented.
 package bitcask
