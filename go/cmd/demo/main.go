@@ -1,15 +1,22 @@
-// Command demo exercises the bitcask package from a real process.
-//
-// The engine is a library, so this is the smallest thing that can drive it end
-// to end and leave data files behind to inspect:
+// Command demo runs one fixed scenario against the library and prints what
+// happened: writes, an overwrite, a delete, then a restart.
 //
 //	go run ./cmd/demo /tmp/bitcask-demo
-//	xxd /tmp/bitcask-demo/000000001.data
+//	go run ./cmd/demo -max-file-size 4096 /tmp/bitcask-demo
 //
 // It reuses the directory rather than clearing it, so running it twice shows
-// the log being recovered. Passing -max-file-size forces rotation:
+// the log being recovered.
 //
-//	go run ./cmd/demo -max-file-size 4096 /tmp/bitcask-demo
+// # Status
+//
+// This is kept as it was written for v0, when it was the only way to watch the
+// engine work in a real process. Two things have since taken that over:
+// TestWalkthrough shows the same sequence down to the individual bytes, and
+// cmd/bitcask runs whatever operation is asked for instead of one script.
+//
+// Nothing maintains this beyond keeping it compiling, and that is on purpose.
+// It uses only the public API, from outside the package, so a build failure
+// here means that API changed — which is worth being told about.
 package main
 
 import (
