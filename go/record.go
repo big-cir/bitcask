@@ -180,5 +180,17 @@ func decodeRecord(src []byte, maxKeySize, maxValueSize uint32) (record, int, err
 	}, n, nil
 }
 
+// valueOffset maps the offset a record starts at to the offset of its value
+// body.
+//
+// This is the only place that turns a record layout into a value offset. The
+// write path, the recovery scan, and the hint builder all have to produce the
+// same number for the same record; when that arithmetic is written out three
+// times, two of them eventually disagree and the index starts pointing a few
+// bytes off, which reads back as neighbouring bytes rather than as an error.
+func valueOffset(recOffset int64, key []byte) int64 {
+	return recOffset + headerSize + int64(len(key))
+}
+
 // isTombstone reports whether r records a deletion rather than a value.
 func (r *record) isTombstone() bool { return r.flags&flagTombstone != 0 }

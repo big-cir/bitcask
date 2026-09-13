@@ -405,12 +405,13 @@ func TestTornTailSurvivesAnotherRestart(t *testing.T) {
 	assertGet(t, db, "after", "value")
 }
 
-// The same damage in a sealed file has no crash to explain it: nothing has
-// written to that file since it was fsynced. Truncating it would silently
-// discard every record after the damage, so Open refuses instead.
-func TestOpenRejectsCorruptedSealedFile(t *testing.T) {
+// corruptSealedFile fills a rotated database, damages one byte inside the
+// first sealed data file, and returns the directory. The damage lands in the
+// first record of a file that rotation sealed long before the process exited,
+// so no crash can account for it.
+func corruptSealedFile(t *testing.T, opts ...Option) string {
+	t.Helper()
 	dir := t.TempDir()
-	opts := []Option{WithMaxFileSize(1 << 10)}
 
 	db := mustOpen(t, dir, opts...)
 	for i := 0; i < 100; i++ {
@@ -422,9 +423,29 @@ func TestOpenRejectsCorruptedSealedFile(t *testing.T) {
 	if len(paths) < 2 {
 		t.Fatalf("got %d data file(s), want at least 2", len(paths))
 	}
-	// Inside the first record of the first file, which rotation sealed long
-	// before the process exited.
 	flipByte(t, paths[0], headerSize+2)
+	return dir
+}
+
+// The same damage in a sealed file has no crash to explain it: nothing has
+// written to that file since it was fsynced. Truncating it would silently
+// discard every record after the damage, so Open refuses instead.
+//
+// The hints are removed first, because recovery only looks at a data file when
+// it has no usable hint for it — see the test below.
+func TestOpenRejectsCorruptedSealedFile(t *testing.T) {
+	opts := []Option{WithMaxFileSize(1 << 10)}
+	dir := corruptSealedFile(t, opts...)
+
+	hints, err := filepath.Glob(filepath.Join(dir, "*.hint"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range hints {
+		if err := os.Remove(h); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	db, err := Open(dir, opts...)
 	if err == nil {
@@ -434,6 +455,36 @@ func TestOpenRejectsCorruptedSealedFile(t *testing.T) {
 	if !errors.Is(err, ErrCorrupted) {
 		t.Fatalf("Open = %v, want ErrCorrupted", err)
 	}
+}
+
+// What a hint costs. With a usable hint, recovery never reads the data file,
+// so damage inside a sealed data file is not noticed at startup — and Get does
+// not check either, because it reads only the value bytes.
+//
+// This is deliberate rather than an oversight: confirming that every hint
+// entry still matches the data file would mean reading the data file, which is
+// the work the hint exists to avoid. The damage surfaces the next time
+// something reads the file in full, which today means only a scan that had to
+// fall back, and later means compaction.
+//
+// The test exists to pin the behaviour down, not to endorse it.
+func TestCorruptionBehindAUsableHintIsNotDetected(t *testing.T) {
+	opts := []Option{WithMaxFileSize(1 << 10)}
+	dir := corruptSealedFile(t, opts...)
+
+	db, err := Open(dir, opts...)
+	if err != nil {
+		t.Fatalf("Open = %v, want success: the hint is intact", err)
+	}
+	defer db.Close()
+
+	if got := db.Len(); got != 100 {
+		t.Fatalf("Len = %d, want 100", got)
+	}
+	// The damaged bytes are part of a key, which lives only in the data file.
+	// The index got that key from the hint, and the value it points at is
+	// untouched, so reads come back correct.
+	assertGet(t, db, "key_0000", testValue(0))
 }
 
 // A stray file this package did not write is left alone rather than treated as
@@ -484,5 +535,130 @@ func flipByte(t *testing.T, path string, off int64) {
 	b[0] ^= 0xFF
 	if _, err := f.WriteAt(b, off); err != nil {
 		t.Fatalf("write at %d: %v", off, err)
+	}
+}
+
+// The ordering rule is "highest seq for a key wins", and nothing in normal
+// operation can tell it apart from "whatever was written last wins": records
+// are appended in seq order and files are read in id order, so the two rules
+// agree on every database this package produces today.
+//
+// They stop agreeing the moment compaction rewrites old records into new
+// files, which is what v3 does. A recovery built on file order would pass
+// every other test in this suite and then return stale values, with no error,
+// once merging starts.
+//
+// These files are therefore assembled by hand, with seq deliberately out of
+// step with position. The scan path and the hint path are both checked, since
+// each applies the rule itself.
+func TestHighestSeqWinsNotFilePosition(t *testing.T) {
+	t.Run("within one file", func(t *testing.T) {
+		dir := t.TempDir()
+
+		var buf []byte
+		buf = append(buf, encodeRecord(2, []byte("k"), []byte("newer"), 0)...)
+		buf = append(buf, encodeRecord(1, []byte("k"), []byte("older"), 0)...)
+		writeDatafile(t, dir, 1, buf)
+
+		db := mustOpen(t, dir)
+		defer db.Close()
+		// File order says "older". Sequence order says "newer".
+		assertGet(t, db, "k", "newer")
+	})
+
+	t.Run("across files", func(t *testing.T) {
+		dir := t.TempDir()
+
+		// The lower file id holds the newer record, which is exactly the shape
+		// compaction produces: merged output is written to a fresh file while
+		// carrying the sequence numbers of the records it copied.
+		writeDatafile(t, dir, 1, encodeRecord(9, []byte("k"), []byte("newer"), 0))
+		writeDatafile(t, dir, 2, encodeRecord(4, []byte("k"), []byte("older"), 0))
+
+		db := mustOpen(t, dir)
+		defer db.Close()
+		assertGet(t, db, "k", "newer")
+	})
+
+	t.Run("a tombstone with a lower seq must not delete", func(t *testing.T) {
+		dir := t.TempDir()
+
+		writeDatafile(t, dir, 1, encodeRecord(7, []byte("k"), []byte("alive"), 0))
+		writeDatafile(t, dir, 2, encodeRecord(3, []byte("k"), nil, flagTombstone))
+
+		db := mustOpen(t, dir)
+		defer db.Close()
+		// The tombstone comes later in the directory but is older. Position
+		// would delete the key; sequence keeps it.
+		assertGet(t, db, "k", "alive")
+	})
+
+	t.Run("through the hint path", func(t *testing.T) {
+		dir := t.TempDir()
+
+		writeDatafile(t, dir, 1, encodeRecord(9, []byte("k"), []byte("newer"), 0))
+		writeDatafile(t, dir, 2, encodeRecord(4, []byte("k"), []byte("older"), 0))
+		// File 2 is the active file and is always scanned, so put the older
+		// record behind a hint by adding a third file to take that role.
+		writeDatafile(t, dir, 3, encodeRecord(11, []byte("other"), []byte("v"), 0))
+
+		opts := &options{maxFileSize: defaultMaxFileSize, maxKeySize: defaultMaxKeySize, maxValueSize: defaultMaxValueSize}
+		for _, id := range []uint32{1, 2} {
+			if err := buildHint(dir, id, opts); err != nil {
+				t.Fatalf("buildHint %d: %v", id, err)
+			}
+		}
+		if _, err := loadHint(dir, 2, defaultMaxKeySize); err != nil {
+			t.Fatalf("hint for file 2 unusable, so this would not test the hint path: %v", err)
+		}
+
+		db := mustOpen(t, dir)
+		defer db.Close()
+		assertGet(t, db, "k", "newer")
+	})
+}
+
+// writeDatafile plants a data file with exactly the bytes given, so that a
+// test can build a history the write path would never produce.
+func writeDatafile(t *testing.T, dir string, id uint32, content []byte) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, datafileName(id)), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Which copy the index points at when two records share a seq.
+//
+// By design that cannot happen to two different records: sequence numbers are
+// never reused, so equal seq means the same record written twice. Both copies
+// hold the same value, so reads are unaffected either way — which is why
+// changing applyEntry's comparison from >= to > breaks no test.
+//
+// It stops being unobservable in v3. Compaction copies records into new files
+// keeping their original seq, so an interrupted merge leaves two copies in
+// different files, and merge's conditional update compares the (fileID, vpos)
+// the index is holding. This test records the current tie-break rather than
+// claiming it is the right one: the first copy in file id order wins.
+//
+// If v3 needs the other rule, changing it here is a decision, not a fix.
+func TestDuplicateSeqKeepsTheFirstCopy(t *testing.T) {
+	dir := t.TempDir()
+
+	rec := encodeRecord(5, []byte("k"), []byte("same value"), 0)
+	writeDatafile(t, dir, 1, rec)
+	writeDatafile(t, dir, 2, rec)
+
+	db := mustOpen(t, dir)
+	defer db.Close()
+
+	// Either copy returns the same bytes. Only the address differs.
+	assertGet(t, db, "k", "same value")
+
+	e, ok := db.keydir.get([]byte("k"))
+	if !ok {
+		t.Fatal("key missing")
+	}
+	if e.fileID != 1 {
+		t.Fatalf("index points at file %d, want 1 (the first copy)", e.fileID)
 	}
 }

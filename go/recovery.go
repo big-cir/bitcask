@@ -37,6 +37,10 @@ type recoveryResult struct {
 // today, which is exactly why implementing the wrong one here is dangerous:
 // the tests pass, and the bug appears later, when compaction starts writing
 // old records into new files.
+//
+// A sealed file with a usable hint file is loaded from the hint instead of
+// being read in full. The active file is always read in full: its tail has to
+// be checked, and its write offset has to be established.
 func recoverKeydir(dir string, kd *keydir, opts *options) (recoveryResult, error) {
 	ids, err := datafileIDs(dir)
 	if err != nil {
@@ -45,7 +49,37 @@ func recoverKeydir(dir string, kd *keydir, opts *options) (recoveryResult, error
 
 	res := recoveryResult{ids: ids}
 	for i, id := range ids {
-		scan, err := scanDatafile(filepath.Join(dir, datafileName(id)), id, kd, opts)
+		sealed := i != len(ids)-1
+
+		if sealed {
+			// A hint is an optimization, so a failure to use one is not a
+			// failure at all: fall through and read the data file, which is
+			// the only thing that was ever the source of truth.
+			if records, err := loadHint(dir, id, opts.maxKeySize); err == nil {
+				for _, h := range records {
+					if h.seq > res.maxSeq {
+						res.maxSeq = h.seq
+					}
+					applyEntry(kd, h.key, keydirEntry{
+						fileID: id,
+						vsz:    h.vsz,
+						vpos:   h.vpos,
+						seq:    h.seq,
+					}, h.flags&flagTombstone != 0)
+				}
+				continue
+			}
+		}
+
+		scan, err := scanDatafile(filepath.Join(dir, datafileName(id)), opts,
+			func(rec record, recOffset int64) {
+				applyEntry(kd, rec.key, keydirEntry{
+					fileID: id,
+					vsz:    uint32(len(rec.value)),
+					vpos:   valueOffset(recOffset, rec.key),
+					seq:    rec.seq,
+				}, rec.isTombstone())
+			})
 		if err != nil {
 			return recoveryResult{}, err
 		}
@@ -66,13 +100,38 @@ func recoverKeydir(dir string, kd *keydir, opts *options) (recoveryResult, error
 		// Treating both alike fails either way: as an error, a normal crash
 		// leaves a database that will not open; as a truncation, real damage
 		// silently discards every record after it.
-		if i != len(ids)-1 {
+		if sealed {
 			return recoveryResult{}, fmt.Errorf("%w: %s at offset %d: %w",
 				ErrCorrupted, datafileName(id), scan.lastGood, scan.reason)
 		}
 		res.torn, res.tornAt = true, scan.lastGood
 	}
 	return res, nil
+}
+
+// applyEntry applies one record's index entry to kd.
+//
+// One comparison resolves overwrites, deletions and duplicate copies of the
+// same record alike: keep whichever version has the higher seq. Sequence
+// numbers are never reused, so two records sharing one are by definition the
+// same record written twice, and ignoring the second is always right.
+//
+// Both recovery paths go through here. The rule is subtle enough that having
+// it written out twice — once for data files, once for hint files — would be a
+// standing invitation for the two to drift.
+func applyEntry(kd *keydir, key []byte, e keydirEntry, tombstone bool) {
+	if cur, ok := kd.get(key); ok && cur.seq >= e.seq {
+		return
+	}
+	if tombstone {
+		// A deleted key is absent from the index, not marked in it. The
+		// tombstone stays on disk, which is the whole point: the index is
+		// rebuilt from the log, so a deletion that left no record behind would
+		// undo itself on the next restart.
+		kd.delete(key)
+		return
+	}
+	kd.put(key, e)
 }
 
 // scanState is the outcome of replaying one data file.
@@ -83,7 +142,8 @@ type scanState struct {
 	reason   error  // why, when torn
 }
 
-// scanDatafile replays one data file into kd.
+// scanDatafile replays one data file, calling visit for every intact record
+// with the offset that record starts at.
 //
 // A truncated or mis-checksummed record is not reported as an error: it is how
 // a crash looks, and only the caller knows whether this file is allowed to end
@@ -93,7 +153,10 @@ type scanState struct {
 // whether it keeps it or not, because the checksum covers the value and there
 // is no way to verify a record without reading all of it. That cost — a full
 // pass over all data at every startup — is the reason hint files exist.
-func scanDatafile(path string, id uint32, kd *keydir, opts *options) (scanState, error) {
+//
+// The record passed to visit aliases the file buffer, so visit must copy
+// anything it keeps.
+func scanDatafile(path string, opts *options, visit func(rec record, recOffset int64)) (scanState, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return scanState{}, err
@@ -109,28 +172,7 @@ func scanDatafile(path string, id uint32, kd *keydir, opts *options) (scanState,
 		if rec.seq > st.maxSeq {
 			st.maxSeq = rec.seq
 		}
-
-		// One comparison resolves overwrites, deletions and duplicate copies
-		// of the same record alike: keep whichever version has the higher seq.
-		// Sequence numbers are never reused, so two records sharing one are by
-		// definition the same record written twice, and ignoring the second is
-		// always right.
-		if e, ok := kd.get(rec.key); !ok || e.seq < rec.seq {
-			if rec.isTombstone() {
-				// A deleted key is absent from the index, not marked in it.
-				// The tombstone stays on disk, which is the whole point: the
-				// index is rebuilt from the log, so a deletion that left no
-				// record behind would undo itself on the next restart.
-				kd.delete(rec.key)
-			} else {
-				kd.put(rec.key, keydirEntry{
-					fileID: id,
-					vsz:    uint32(len(rec.value)),
-					vpos:   st.lastGood + headerSize + int64(len(rec.key)),
-					seq:    rec.seq,
-				})
-			}
-		}
+		visit(rec, st.lastGood)
 		st.lastGood += int64(n)
 	}
 	return st, nil

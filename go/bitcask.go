@@ -49,6 +49,13 @@ func Open(dir string, opts ...Option) (*DB, error) {
 		files:  make(map[uint32]*datafile),
 	}
 
+	// A crash can leave a half-written hint file under its temporary name.
+	// Nothing reads those, but this is the moment the directory is being
+	// examined anyway.
+	if err := removeStaleHintTemps(dir); err != nil {
+		return nil, err
+	}
+
 	res, err := recoverKeydir(dir, db.keydir, &o)
 	if err != nil {
 		return nil, err
@@ -250,9 +257,8 @@ func (db *DB) appendRecord(key, value []byte, flags uint8) (keydirEntry, error) 
 	return keydirEntry{
 		fileID: db.active.id,
 		vsz:    uint32(len(value)),
-		// The one place that knows how a record's layout maps to a value offset.
-		vpos: recOffset + headerSize + int64(len(key)),
-		seq:  seq,
+		vpos:   valueOffset(recOffset, key),
+		seq:    seq,
 	}, nil
 }
 
@@ -295,8 +301,20 @@ func (db *DB) rotate() error {
 		return err
 	}
 
+	sealed := db.active
 	db.files[next.id] = next
 	db.active = next
+
+	// This is the only moment a hint file can be written: the file has just
+	// stopped changing, and nothing will append to it again. A summary of a
+	// file that is still growing is stale as soon as it is written.
+	//
+	// The error is deliberately dropped. A missing or unusable hint costs
+	// startup time and nothing else, because recovery reads the data file
+	// whenever it cannot use a hint. Failing the Put that happened to trigger
+	// the rotation would turn a slower startup into lost data.
+	_ = buildHint(db.dir, sealed.id, &db.opts)
+
 	return nil
 }
 
